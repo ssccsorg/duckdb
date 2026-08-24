@@ -1,0 +1,16 @@
+{
+  "phase": "profile_gate_index_forced",
+  "version": "v1.5.5",
+  "note": "index_scan_percentage forced to 1.0 to activate the ART path; the default 0.001 never activates it on this table because the minimum single-dimension selectivity 0.465 percent exceeds the 0.1 percent threshold",
+  "settings": {
+    "index_scan_percentage": 1.0,
+    "index_scan_max_count": 2048,
+    "threads": 10
+  },
+  "queries": {
+    "S1/point/count": {"median_ms": 25.286, "rows_scanned": 46225, "matches": 46225, "note": "ART path, 20x slower than the full scan (1.27 ms)"},
+    "S1/point/payload": {"median_ms": 37.239, "rows_scanned": 46225, "matches": 46225, "note": "ART path"},
+    "P3/point/count": {"median_ms": 1.695, "rows_scanned": 9938375, "matches": 1, "note": "full scan despite indexes, multi-filter FIXME confirmed at scale"},
+    "R3/1e-04/count": {"median_ms": 3.365, "rows_scanned": 9938375, "matches": 1000, "note": "full scan despite indexes"}
+  }
+}
