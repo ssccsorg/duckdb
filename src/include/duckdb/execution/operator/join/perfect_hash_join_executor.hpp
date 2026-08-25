@@ -20,11 +20,15 @@ class HashJoinGlobalSinkState;
 class PhysicalHashJoin;
 
 struct PerfectHashJoinStats {
-	Value build_min;
-	Value build_max;
+	//! Per-dimension build minima and maxima
+	vector<Value> build_mins;
+	vector<Value> build_maxs;
+	//! Per-dimension extents (max - min + 1)
+	vector<idx_t> extents;
+	//! The packed key space: the product of the extents, the mixed-radix lattice
+	idx_t packed_space = 0;
 	bool is_build_small = false;
 	bool is_build_dense = false;
-	idx_t build_range = 0;
 };
 
 //! PhysicalHashJoin represents a hash loop join between two tables
@@ -35,32 +39,21 @@ public:
 	PerfectHashJoinExecutor(const PhysicalHashJoin &join, JoinHashTable &ht);
 
 public:
-	bool CanDoPerfectHashJoin(const PhysicalHashJoin &op, const Value &min, const Value &max);
+	//! The number of equality conditions (dimensions) of the join
+	idx_t GetDimensionCount() const;
+	bool CanDoPerfectHashJoin(const PhysicalHashJoin &op, const vector<Value> &mins, const vector<Value> &maxs);
 
-	const LogicalType &GetKeyType() const;
 	bool BuildPerfectHashTable();
 
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context);
 	OperatorResultType ProbePerfectHashTable(ExecutionContext &context, DataChunk &input, DataChunk &lhs_output_columns,
 	                                         DataChunk &chunk, OperatorState &state);
 
-	void FillSelectionVectorSwitchProbe(const Vector &source, const idx_t &count, SelectionVector &probe_sel_vec,
-	                                    idx_t &probe_sel_count, optional_ptr<SelectionVector> build_sel_vec) const;
-
 private:
-	template <bool BUILD_SEL_VEC>
-	void FillSelectionVectorSwitchProbe(const Vector &source, const idx_t &count, SelectionVector &probe_sel_vec,
-	                                    idx_t &probe_sel_count, SelectionVector *build_sel_vec) const;
-	template <typename T, bool BUILD_SEL_VEC>
-	void TemplatedFillSelectionVectorProbe(const Vector &source, const idx_t &count, SelectionVector &probe_sel_vec,
-	                                       idx_t &probe_sel_count, SelectionVector *build_sel_vec) const;
-
-	bool FillSelectionVectorSwitchBuild(const Vector &source, SelectionVector &sel_vec, SelectionVector &seq_sel_vec,
-	                                    idx_t count);
-	template <typename T>
-	bool TemplatedFillSelectionVectorBuild(const Vector &source, SelectionVector &sel_vec, SelectionVector &seq_sel_vec,
-	                                       idx_t count);
 	bool FullScanHashTable();
+	template <typename T>
+	bool TemplatedComputeDimOffsets(const Vector &source, idx_t count, T min_value, T max_value,
+	                                vector<idx_t> &offsets, vector<bool> &in_domain) const;
 
 private:
 	const PhysicalHashJoin &join;

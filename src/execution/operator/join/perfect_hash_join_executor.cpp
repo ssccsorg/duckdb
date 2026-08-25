@@ -11,8 +11,8 @@ PerfectHashJoinExecutor::PerfectHashJoinExecutor(const PhysicalHashJoin &join_p,
     : join(join_p), ht(ht_p) {
 }
 
-const LogicalType &PerfectHashJoinExecutor::GetKeyType() const {
-	return ht.equality_types[0];
+idx_t PerfectHashJoinExecutor::GetDimensionCount() const {
+	return join.conditions.size();
 }
 
 //===--------------------------------------------------------------------===//
@@ -70,7 +70,8 @@ bool ExtractNumericValue(const Value &val, hugeint_t &result) {
 	return true;
 }
 
-bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, const Value &min, const Value &max) {
+bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, const vector<Value> &mins,
+                                                   const vector<Value> &maxs) {
 	// TODO: Add support for residual predicates
 	if (op.predicate) {
 		return false;
@@ -80,12 +81,16 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
 		return true; // Already true based on static statistics
 	}
 
-	// We only do this optimization for inner joins with one integer equality condition
-	const auto key_type = op.conditions[0].GetLHS().GetReturnType();
-	if (op.join_type != JoinType::INNER || op.conditions.size() != 1 ||
-	    op.conditions[0].GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
-	    !TypeIsInteger(key_type.InternalType())) {
+	// We only do this optimization for inner joins with integer equality conditions
+	const auto dims = mins.size();
+	if (op.join_type != JoinType::INNER || op.conditions.size() != dims || dims == 0) {
 		return false;
+	}
+	for (idx_t d = 0; d < dims; d++) {
+		if (op.conditions[d].GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+		    !TypeIsInteger(op.conditions[d].GetLHS().GetReturnType().InternalType())) {
+			return false;
+		}
 	}
 
 	// We bail out if there are nested types on the RHS
@@ -100,35 +105,49 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
 		}
 	}
 
-	// And when the build range is smaller than the threshold
-	perfect_join_statistics.build_min = min;
-	perfect_join_statistics.build_max = max;
-	hugeint_t min_value, max_value;
-	if (!ExtractNumericValue(perfect_join_statistics.build_min, min_value) ||
-	    !ExtractNumericValue(perfect_join_statistics.build_max, max_value)) {
-		return false;
-	}
-	if (max_value < min_value) {
-		return false; // Empty table
-	}
-
-	hugeint_t build_range;
-	if (!TrySubtractOperator::Operation(max_value, min_value, build_range)) {
-		return false;
+	// The packed key space is the product of the per-condition extents
+	idx_t packed_space = 1;
+	vector<idx_t> extents;
+	extents.reserve(dims);
+	for (idx_t d = 0; d < dims; d++) {
+		hugeint_t min_value, max_value;
+		if (!ExtractNumericValue(mins[d], min_value) || !ExtractNumericValue(maxs[d], max_value)) {
+			return false;
+		}
+		if (max_value < min_value) {
+			return false; // Empty table
+		}
+		hugeint_t extent_value;
+		if (!TrySubtractOperator::Operation(max_value, min_value, extent_value)) {
+			return false;
+		}
+		extent_value += 1;
+		if (extent_value > Hugeint::Convert(NumericLimits<idx_t>::Maximum())) {
+			return false;
+		}
+		const auto extent = NumericCast<idx_t>(extent_value);
+		if (packed_space > NumericLimits<idx_t>::Maximum() / extent) {
+			return false;
+		}
+		packed_space *= extent;
+		extents.push_back(extent);
 	}
 
 	// The max size our build must have to run the perfect HJ
 	static constexpr idx_t MAX_BUILD_SIZE = 1048576;
-	if (build_range > Hugeint::Convert(MAX_BUILD_SIZE)) {
-		return false;
-	}
-	perfect_join_statistics.build_range = NumericCast<idx_t>(build_range);
-
-	// If count is larger than range (duplicates), we bail out
-	if (ht.Count() > perfect_join_statistics.build_range) {
+	if (packed_space > MAX_BUILD_SIZE) {
 		return false;
 	}
 
+	// If count is larger than the packed space (duplicates), we bail out
+	if (ht.Count() > packed_space) {
+		return false;
+	}
+
+	perfect_join_statistics.build_mins = mins;
+	perfect_join_statistics.build_maxs = maxs;
+	perfect_join_statistics.extents = extents;
+	perfect_join_statistics.packed_space = packed_space;
 	perfect_join_statistics.is_build_small = true;
 	return true;
 }
@@ -138,7 +157,7 @@ bool PerfectHashJoinExecutor::CanDoPerfectHashJoin(const PhysicalHashJoin &op, c
 //===--------------------------------------------------------------------===//
 bool PerfectHashJoinExecutor::BuildPerfectHashTable() {
 	// First, allocate memory for each build column
-	const auto build_size = perfect_join_statistics.build_range + 1;
+	const auto build_size = perfect_join_statistics.packed_space;
 	for (const auto &type : join.rhs_output_columns.col_types) {
 		// PHJ keeps each entry alive for the operator's lifetime and wraps it in every emitted chunk
 		perfect_hash_table.emplace_back(DictionaryVector::CreateReusableGlobalDictionary(type, build_size));
@@ -155,28 +174,99 @@ bool PerfectHashJoinExecutor::BuildPerfectHashTable() {
 bool PerfectHashJoinExecutor::FullScanHashTable() {
 	auto &data_collection = ht.GetDataCollection();
 
-	// TODO: In a parallel finalize: One should exclusively lock and each thread should do one part of the code below.
-	Vector tuples_addresses(LogicalType::POINTER, ht.Count()); // allocate space for all the tuples
-	Vector build_vector(GetKeyType(), ht.Count());
-	auto key_count = ht.ScanKeyColumn(tuples_addresses, build_vector, 0);
+	const auto dims = GetDimensionCount();
+	const auto key_count = ht.Count();
+	Vector tuples_addresses(LogicalType::POINTER, key_count);
 
-	// Now fill the selection vector using the build keys and create a sequential vector
-	// TODO: add check for fast pass when probe is part of build domain
-	SelectionVector sel_build(key_count + 1);
-	SelectionVector sel_tuples(key_count + 1);
-	bool success = FillSelectionVectorSwitchBuild(build_vector, sel_build, sel_tuples, key_count);
-
-	// early out
-	if (!success) {
-		return false;
+	// Scan each key column of the build side
+	vector<Vector> key_vectors;
+	key_vectors.reserve(dims);
+	for (idx_t d = 0; d < dims; d++) {
+		Vector build_vector(ht.equality_types[d], key_count);
+		ht.ScanKeyColumn(tuples_addresses, build_vector, d);
+		key_vectors.push_back(std::move(build_vector));
 	}
 
-	const auto build_size = perfect_join_statistics.build_range + 1;
+	// Per-dimension offsets and domain validity: a row is in the domain only if
+	// every key lies within its condition's min-max range
+	vector<vector<idx_t>> offsets(dims, vector<idx_t>(key_count));
+	vector<bool> in_domain(key_count, true);
+	for (idx_t d = 0; d < dims; d++) {
+		const auto &min_value = perfect_join_statistics.build_mins[d];
+		const auto &max_value = perfect_join_statistics.build_maxs[d];
+		switch (key_vectors[d].GetType().InternalType()) {
+		case PhysicalType::INT8:
+			TemplatedComputeDimOffsets<int8_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<int8_t>(),
+			                                   max_value.GetValueUnsafe<int8_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT16:
+			TemplatedComputeDimOffsets<int16_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<int16_t>(),
+			                                    max_value.GetValueUnsafe<int16_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT32:
+			TemplatedComputeDimOffsets<int32_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<int32_t>(),
+			                                    max_value.GetValueUnsafe<int32_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT64:
+			TemplatedComputeDimOffsets<int64_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<int64_t>(),
+			                                    max_value.GetValueUnsafe<int64_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT128:
+			TemplatedComputeDimOffsets<hugeint_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<hugeint_t>(),
+			                                      max_value.GetValueUnsafe<hugeint_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT8:
+			TemplatedComputeDimOffsets<uint8_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<uint8_t>(),
+			                                    max_value.GetValueUnsafe<uint8_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT16:
+			TemplatedComputeDimOffsets<uint16_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<uint16_t>(),
+			                                     max_value.GetValueUnsafe<uint16_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT32:
+			TemplatedComputeDimOffsets<uint32_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<uint32_t>(),
+			                                     max_value.GetValueUnsafe<uint32_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT64:
+			TemplatedComputeDimOffsets<uint64_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<uint64_t>(),
+			                                     max_value.GetValueUnsafe<uint64_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT128:
+			TemplatedComputeDimOffsets<uhugeint_t>(key_vectors[d], key_count, min_value.GetValueUnsafe<uhugeint_t>(),
+			                                       max_value.GetValueUnsafe<uhugeint_t>(), offsets[d], in_domain);
+			break;
+		default:
+			throw NotImplementedException("Type not supported for perfect hash join");
+		}
+	}
+
+	// Fold the offsets into the mixed-radix position and check duplicates
+	SelectionVector sel_build(key_count + 1);
+	SelectionVector sel_tuples(key_count + 1);
+	const auto &extents = perfect_join_statistics.extents;
+	unique_keys = 0;
+	for (idx_t i = 0; i < key_count; i++) {
+		if (!in_domain[i]) {
+			continue;
+		}
+		idx_t position = offsets[0][i];
+		for (idx_t d = 1; d < dims; d++) {
+			position = position * extents[d] + offsets[d][i];
+		}
+		if (bitmap_build_idx.RowIsValidUnsafe(position)) {
+			return false; // duplicate key
+		}
+		bitmap_build_idx.SetValidUnsafe(position);
+		sel_build.set_index(unique_keys, position);
+		sel_tuples.set_index(unique_keys, i);
+		unique_keys++;
+	}
+
+	const auto build_size = perfect_join_statistics.packed_space;
 	if (unique_keys == build_size && !ht.has_null) {
 		perfect_join_statistics.is_build_dense = true;
 		bitmap_build_idx.Reset(build_size); // All valid
 	}
-	key_count = unique_keys; // do not consider keys out of the range
 
 	// Full scan the remaining build columns and fill the perfect hash table
 	for (idx_t i = 0; i < join.rhs_output_columns.col_types.size(); i++) {
@@ -185,7 +275,7 @@ bool PerfectHashJoinExecutor::FullScanHashTable() {
 		D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
 		auto &col_mask = FlatVector::ValidityMutable(vector);
 		col_mask.Reset(build_size);
-		data_collection.Gather(tuples_addresses, sel_tuples, key_count, output_col_idx, vector, sel_build, nullptr);
+		data_collection.Gather(tuples_addresses, sel_tuples, unique_keys, output_col_idx, vector, sel_build, nullptr);
 		// This ensures the empty entries are set to NULL, so that the emitted dictionary vectors make sense
 		col_mask.Combine(bitmap_build_idx, build_size);
 	}
@@ -193,57 +283,17 @@ bool PerfectHashJoinExecutor::FullScanHashTable() {
 	return true;
 }
 
-bool PerfectHashJoinExecutor::FillSelectionVectorSwitchBuild(const Vector &source, SelectionVector &sel_vec,
-                                                             SelectionVector &seq_sel_vec, idx_t count) {
-	switch (source.GetType().InternalType()) {
-	case PhysicalType::INT8:
-		return TemplatedFillSelectionVectorBuild<int8_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::INT16:
-		return TemplatedFillSelectionVectorBuild<int16_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::INT32:
-		return TemplatedFillSelectionVectorBuild<int32_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::INT64:
-		return TemplatedFillSelectionVectorBuild<int64_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::INT128:
-		return TemplatedFillSelectionVectorBuild<hugeint_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::UINT8:
-		return TemplatedFillSelectionVectorBuild<uint8_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::UINT16:
-		return TemplatedFillSelectionVectorBuild<uint16_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::UINT32:
-		return TemplatedFillSelectionVectorBuild<uint32_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::UINT64:
-		return TemplatedFillSelectionVectorBuild<uint64_t>(source, sel_vec, seq_sel_vec, count);
-	case PhysicalType::UINT128:
-		return TemplatedFillSelectionVectorBuild<uhugeint_t>(source, sel_vec, seq_sel_vec, count);
-	default:
-		throw NotImplementedException("Type not supported for perfect hash join");
-	}
-}
-
 template <typename T>
-bool PerfectHashJoinExecutor::TemplatedFillSelectionVectorBuild(const Vector &source, SelectionVector &sel_vec,
-                                                                SelectionVector &seq_sel_vec, idx_t count) {
-	if (perfect_join_statistics.build_min.IsNull() || perfect_join_statistics.build_max.IsNull()) {
-		return false;
-	}
-	auto min_value = perfect_join_statistics.build_min.GetValueUnsafe<T>();
-	auto max_value = perfect_join_statistics.build_max.GetValueUnsafe<T>();
+bool PerfectHashJoinExecutor::TemplatedComputeDimOffsets(const Vector &source, idx_t count, T min_value, T max_value,
+                                                         vector<idx_t> &offsets, vector<bool> &in_domain) const {
 	auto entries = source.Values<T>();
-	// generate the selection vector
-	for (idx_t i = 0, sel_idx = 0; i < count; ++i) {
+	for (idx_t i = 0; i < count; i++) {
 		auto input_value = entries.GetValueUnsafe(i);
-		// add index to selection vector if value in the range
+		// compute the offset if the value is in the range
 		if (min_value <= input_value && input_value <= max_value) {
-			auto idx = UnsafeNumericCast<idx_t>(input_value - min_value); // subtract min value to get the idx position
-			sel_vec.set_index(sel_idx, idx);
-			if (bitmap_build_idx.RowIsValidUnsafe(idx)) {
-				return false;
-			} else {
-				bitmap_build_idx.SetValidUnsafe(idx);
-				unique_keys++;
-			}
-			seq_sel_vec.set_index(sel_idx++, i);
+			offsets[i] = UnsafeNumericCast<idx_t>(input_value - min_value);
+		} else {
+			in_domain[i] = false;
 		}
 	}
 	return true;
@@ -286,11 +336,80 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
 	// fetch the join keys from the chunk
 	state.join_keys.Reset();
 	state.probe_executor.Execute(input, state.join_keys);
-	// select the keys that are in the min-max range
-	const auto &keys_vec = state.join_keys.data[0];
-	auto keys_count = state.join_keys.size();
-	// todo: add check for fast pass when probe is part of build domain
-	FillSelectionVectorSwitchProbe(keys_vec, keys_count, state.probe_sel_vec, probe_sel_count, &state.build_sel_vec);
+	const auto keys_count = state.join_keys.size();
+	const auto dims = GetDimensionCount();
+
+	// Per-dimension offsets of the probe keys relative to the build domain
+	vector<vector<idx_t>> offsets(dims, vector<idx_t>(keys_count));
+	vector<bool> in_domain(keys_count, true);
+	for (idx_t d = 0; d < dims; d++) {
+		const auto &keys_vec = state.join_keys.data[d];
+		const auto &min_value = perfect_join_statistics.build_mins[d];
+		const auto &max_value = perfect_join_statistics.build_maxs[d];
+		switch (keys_vec.GetType().InternalType()) {
+		case PhysicalType::INT8:
+			TemplatedComputeDimOffsets<int8_t>(keys_vec, keys_count, min_value.GetValueUnsafe<int8_t>(),
+			                                   max_value.GetValueUnsafe<int8_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT16:
+			TemplatedComputeDimOffsets<int16_t>(keys_vec, keys_count, min_value.GetValueUnsafe<int16_t>(),
+			                                    max_value.GetValueUnsafe<int16_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT32:
+			TemplatedComputeDimOffsets<int32_t>(keys_vec, keys_count, min_value.GetValueUnsafe<int32_t>(),
+			                                    max_value.GetValueUnsafe<int32_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT64:
+			TemplatedComputeDimOffsets<int64_t>(keys_vec, keys_count, min_value.GetValueUnsafe<int64_t>(),
+			                                    max_value.GetValueUnsafe<int64_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::INT128:
+			TemplatedComputeDimOffsets<hugeint_t>(keys_vec, keys_count, min_value.GetValueUnsafe<hugeint_t>(),
+			                                      max_value.GetValueUnsafe<hugeint_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT8:
+			TemplatedComputeDimOffsets<uint8_t>(keys_vec, keys_count, min_value.GetValueUnsafe<uint8_t>(),
+			                                    max_value.GetValueUnsafe<uint8_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT16:
+			TemplatedComputeDimOffsets<uint16_t>(keys_vec, keys_count, min_value.GetValueUnsafe<uint16_t>(),
+			                                     max_value.GetValueUnsafe<uint16_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT32:
+			TemplatedComputeDimOffsets<uint32_t>(keys_vec, keys_count, min_value.GetValueUnsafe<uint32_t>(),
+			                                     max_value.GetValueUnsafe<uint32_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT64:
+			TemplatedComputeDimOffsets<uint64_t>(keys_vec, keys_count, min_value.GetValueUnsafe<uint64_t>(),
+			                                     max_value.GetValueUnsafe<uint64_t>(), offsets[d], in_domain);
+			break;
+		case PhysicalType::UINT128:
+			TemplatedComputeDimOffsets<uhugeint_t>(keys_vec, keys_count, min_value.GetValueUnsafe<uhugeint_t>(),
+			                                       max_value.GetValueUnsafe<uhugeint_t>(), offsets[d], in_domain);
+			break;
+		default:
+			throw NotImplementedException("Type not supported for perfect hash join");
+		}
+	}
+
+	// Fold the offsets into the mixed-radix position and fill the selection vectors
+	const auto &extents = perfect_join_statistics.extents;
+	for (idx_t i = 0; i < keys_count; i++) {
+		if (!in_domain[i]) {
+			continue;
+		}
+		idx_t position = offsets[0][i];
+		for (idx_t d = 1; d < dims; d++) {
+			position = position * extents[d] + offsets[d][i];
+		}
+		// only probe positions that are occupied by the build side
+		if (!bitmap_build_idx.RowIsValid(position)) {
+			continue;
+		}
+		state.build_sel_vec.set_index(probe_sel_count, position);
+		state.probe_sel_vec.set_index(probe_sel_count, i);
+		probe_sel_count++;
+	}
 
 	// If build is dense and probe is in build's domain, just reference probe
 	if (perfect_join_statistics.is_build_dense && keys_count == probe_sel_count) {
@@ -306,98 +425,6 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
 		result_vector.Dictionary(perfect_hash_table[i], state.build_sel_vec, probe_sel_count);
 	}
 	return OperatorResultType::NEED_MORE_INPUT;
-}
-
-void PerfectHashJoinExecutor::FillSelectionVectorSwitchProbe(const Vector &source, const idx_t &count,
-                                                             SelectionVector &probe_sel_vec, idx_t &probe_sel_count,
-                                                             optional_ptr<SelectionVector> build_sel_vec) const {
-	if (build_sel_vec) {
-		FillSelectionVectorSwitchProbe<true>(source, count, probe_sel_vec, probe_sel_count, build_sel_vec.get());
-	} else {
-		FillSelectionVectorSwitchProbe<false>(source, count, probe_sel_vec, probe_sel_count, nullptr);
-	}
-}
-
-template <bool BUILD_SEL_VEC>
-void PerfectHashJoinExecutor::FillSelectionVectorSwitchProbe(const Vector &source, const idx_t &count,
-                                                             SelectionVector &probe_sel_vec, idx_t &probe_sel_count,
-                                                             SelectionVector *build_sel_vec) const {
-	D_ASSERT(BUILD_SEL_VEC == static_cast<bool>(build_sel_vec));
-	switch (source.GetType().InternalType()) {
-	case PhysicalType::INT8:
-		TemplatedFillSelectionVectorProbe<int8_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                         build_sel_vec);
-		break;
-	case PhysicalType::INT16:
-		TemplatedFillSelectionVectorProbe<int16_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                          build_sel_vec);
-		break;
-	case PhysicalType::INT32:
-		TemplatedFillSelectionVectorProbe<int32_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                          build_sel_vec);
-		break;
-	case PhysicalType::INT64:
-		TemplatedFillSelectionVectorProbe<int64_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                          build_sel_vec);
-		break;
-	case PhysicalType::INT128:
-		TemplatedFillSelectionVectorProbe<hugeint_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                            build_sel_vec);
-		break;
-	case PhysicalType::UINT8:
-		TemplatedFillSelectionVectorProbe<uint8_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                          build_sel_vec);
-		break;
-	case PhysicalType::UINT16:
-		TemplatedFillSelectionVectorProbe<uint16_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                           build_sel_vec);
-		break;
-	case PhysicalType::UINT32:
-		TemplatedFillSelectionVectorProbe<uint32_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                           build_sel_vec);
-		break;
-	case PhysicalType::UINT64:
-		TemplatedFillSelectionVectorProbe<uint64_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                           build_sel_vec);
-		break;
-	case PhysicalType::UINT128:
-		TemplatedFillSelectionVectorProbe<uhugeint_t, BUILD_SEL_VEC>(source, count, probe_sel_vec, probe_sel_count,
-		                                                             build_sel_vec);
-		break;
-	default:
-		throw NotImplementedException("Type not supported");
-	}
-}
-
-template <typename T, bool BUILD_SEL_VEC>
-void PerfectHashJoinExecutor::TemplatedFillSelectionVectorProbe(const Vector &source, const idx_t &count,
-                                                                SelectionVector &probe_sel_vec, idx_t &probe_sel_count,
-                                                                SelectionVector *build_sel_vec) const {
-	D_ASSERT(probe_sel_count == 0);
-	const auto min_value = perfect_join_statistics.build_min.GetValueUnsafe<T>();
-	const auto max_value = perfect_join_statistics.build_max.GetValueUnsafe<T>();
-
-	auto entries = source.Values<T>();
-	// build selection vector for non-dense build
-	for (idx_t i = 0; i < count; ++i) {
-		auto entry = entries[i];
-		if (!entry.IsValid()) {
-			continue;
-		}
-		const auto &input_value = entry.GetValue();
-		// add index to selection vector if value in the range
-		if (min_value <= input_value && input_value <= max_value) {
-			// subtract min value to get the idx
-			const auto idx = UnsafeNumericCast<idx_t>(input_value - min_value);
-			// position check for matches in the build
-			if (bitmap_build_idx.RowIsValid(idx)) {
-				if (BUILD_SEL_VEC) {
-					build_sel_vec->set_index(probe_sel_count, idx);
-				}
-				probe_sel_vec.set_index(probe_sel_count++, i);
-			}
-		}
-	}
 }
 
 } // namespace duckdb
