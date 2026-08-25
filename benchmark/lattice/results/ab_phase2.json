@@ -1,0 +1,30 @@
+{
+  "phase": "ab_phase2",
+  "build": "release",
+  "rows": 9938375,
+  "dims": 215,
+  "repeats": 7,
+  "matrix_median_ms": {
+    "P3_point/B0_scan": 1.0,
+    "P3_point/B2_lattice": 1.0,
+    "R3_range/B0_scan": 1.0,
+    "R3_range/B2_lattice": 2.0,
+    "S1_point/B0_scan": 1.0,
+    "S1_point/B2_lattice": 33.0,
+    "S1_point/B1_art_forced": 0.0
+  },
+  "volume_20000": {
+    "B0_scan_total_s": 9.59,
+    "B0_scan_ms_per_query": 0.479,
+    "B2_lattice_total_s": 6.23,
+    "B2_lattice_ms_per_query": 0.311,
+    "ratio": 1.54
+  },
+  "notes": [
+    "The in-memory scan per point query is about 0.48 ms including statement dispatch in the release build; the lattice removes about 0.17 ms (1.54x at volume).",
+    "The lattice loses on wide queries (S1 point returns 46,225 rows at 33 ms against 1 ms for the scan) because the table function materializes rows through the function path.",
+    "The profile gate's 1.37 ms per query via the python driver overestimated the scan share; the driver overhead was a large component.",
+    "The matrix point timings are below the CLI timer resolution of 1 ms; the volume measurement is the reliable comparison.",
+    "The I/O-dominated case (cold cache, larger table) is untested; the in-memory result is a measured near-parity."
+  ]
+}
