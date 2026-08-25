@@ -2,15 +2,15 @@
 """Phase 2 A/B: B0 scan vs B1 ART vs B2 lattice_scan on the same query matrix.
 
 Uses a fork build binary (debug or release), which links the lattice extension
-statically. The table is the 9,938,375-row lattice (215 cubed, one row per
-cell), stored in lattice order, payload = the cell linear index.
+statically. The table is a regular lattice (D cubed rows, one row per cell),
+stored in lattice order, payload = the cell linear index.
 
 Measurements:
 - matrix: median wall time per (path, query) over repeats, via the CLI timer
 - volume: total wall time for point queries per path, one statement each,
   batched per CLI session
 
-Usage: bench_ab.py [path-to-duckdb-cli]
+Usage: bench_ab.py [path-to-duckdb-cli] [dims] [volume]
 """
 from __future__ import annotations
 
@@ -23,31 +23,32 @@ import tempfile
 import time
 
 CLI = sys.argv[1] if len(sys.argv) > 1 else "build/release/duckdb"
+D = int(sys.argv[2]) if len(sys.argv) > 2 else 215
+VOLUME = int(sys.argv[3]) if len(sys.argv) > 3 else 20_000
 _fd, _path = tempfile.mkstemp(suffix=".duckdb")
 os.close(_fd)
 os.unlink(_path)
 DB_PATH = _path
-D = 215
 N = D * D * D
 REPEATS = 7
-VOLUME = 20_000
 VOLUME_BATCH = 1_000
 
 SETUP = f"""
-CREATE TABLE lattice_bench AS
-  SELECT (x / {D * D})::INTEGER % {D} AS d1, (x / {D})::INTEGER % {D} AS d2,
-         (x % {D})::INTEGER AS d3, x AS payload
-  FROM range(0, {N}) t(x);
-CREATE TABLE t_sorted AS SELECT * FROM lattice_bench ORDER BY d1, d2, d3;
+CREATE TABLE t_sorted AS
+  SELECT d1, d2, d3, x AS payload FROM (
+    SELECT (x / {D * D})::INTEGER % {D} AS d1, (x / {D})::INTEGER % {D} AS d2,
+           (x % {D})::INTEGER AS d3, x
+    FROM range(0, {N}) t(x)
+  ) ORDER BY d1, d2, d3;
 """
 
 MATRIX = [
     ("P3 point", "SELECT count(*) FROM t_sorted WHERE d1 = 7 AND d2 = 9 AND d3 = 11",
-     "SELECT count(*) FROM lattice_scan('t_sorted','d1,d2,d3','payload',215,215,215,7,7,9,9,11,11)"),
+     f"SELECT count(*) FROM lattice_scan('t_sorted','d1,d2,d3','payload',{D},{D},{D},7,7,9,9,11,11)"),
     ("R3 range", "SELECT count(*), sum(payload) FROM t_sorted WHERE d1 BETWEEN 10 AND 20 AND d2 BETWEEN 10 AND 20 AND d3 BETWEEN 10 AND 20",
-     "SELECT count(*), sum(payload) FROM lattice_scan('t_sorted','d1,d2,d3','payload',215,215,215,10,20,10,20,10,20)"),
+     f"SELECT count(*), sum(payload) FROM lattice_scan('t_sorted','d1,d2,d3','payload',{D},{D},{D},10,20,10,20,10,20)"),
     ("S1 point", "SELECT count(*) FROM t_sorted WHERE d1 = 7",
-     "SELECT count(*) FROM lattice_scan('t_sorted','d1,d2,d3','payload',215,215,215,7,7,NULL,NULL,NULL,NULL)"),
+     f"SELECT count(*) FROM lattice_scan('t_sorted','d1,d2,d3','payload',{D},{D},{D},7,7,NULL,NULL,NULL,NULL)"),
 ]
 
 
@@ -109,7 +110,7 @@ def main():
 
     vol_scan = volume_sql(lambda x, y, z: f"SELECT count(*) FROM t_sorted WHERE d1 = {x} AND d2 = {y} AND d3 = {z}")
     vol_lattice = volume_sql(
-        lambda x, y, z: f"SELECT count(*) FROM lattice_scan('t_sorted','d1,d2,d3','payload',215,215,215,{x},{x},{y},{y},{z},{z})")
+        lambda x, y, z: f"SELECT count(*) FROM lattice_scan('t_sorted','d1,d2,d3','payload',{D},{D},{D},{x},{x},{y},{y},{z},{z})")
 
     print()
     print("volume workload (%d point queries, one statement each, %d per CLI session):" % (VOLUME, VOLUME_BATCH))
