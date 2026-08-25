@@ -47,36 +47,49 @@ def main():
     print(f"environment: cli={CLI}, repeats={REPEATS}")
     print()
 
-    # (label, dims, extent per dim, row count)
+    # (label, create sql, join sql)
     workloads = [
-        ("2D 100^2", 2, 100),
-        ("2D 300^2", 2, 300),
-        ("2D 700^2", 2, 700),
-        ("3D 21^3", 3, 21),
-        ("3D 40^3", 3, 40),
-        ("3D 90^3", 3, 90),
+        ("2D 100^2",
+         "DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // 100)::INTEGER AS k1, (x % 100)::INTEGER AS k2, x AS v FROM range(10000) t(x);",
+         "SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2)"),
+        ("2D 300^2",
+         "DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // 300)::INTEGER AS k1, (x % 300)::INTEGER AS k2, x AS v FROM range(90000) t(x);",
+         "SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2)"),
+        ("2D 700^2",
+         "DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // 700)::INTEGER AS k1, (x % 700)::INTEGER AS k2, x AS v FROM range(490000) t(x);",
+         "SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2)"),
+        ("3D 21^3",
+         "DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // 441)::INTEGER AS k1, (x // 21 % 21)::INTEGER AS k2, (x % 21)::INTEGER AS k3, x AS v FROM range(9261) t(x);",
+         "SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2, k3)"),
+        ("3D 40^3",
+         "DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // 1600)::INTEGER AS k1, (x // 40 % 40)::INTEGER AS k2, (x % 40)::INTEGER AS k3, x AS v FROM range(64000) t(x);",
+         "SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2, k3)"),
+        ("3D 90^3",
+         "DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // 8100)::INTEGER AS k1, (x // 90 % 90)::INTEGER AS k2, (x % 90)::INTEGER AS k3, x AS v FROM range(729000) t(x);",
+         "SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2, k3)"),
+        ("probe 1k x 1M 2D",
+         "DROP TABLE IF EXISTS s; DROP TABLE IF EXISTS p; "
+         "CREATE TABLE s AS SELECT (x // 100)::INTEGER AS k1, (x % 100)::INTEGER AS k2, x AS v FROM range(1000) t(x); "
+         "CREATE TABLE p AS SELECT (x // 100 % 100)::INTEGER AS k1, (x % 100)::INTEGER AS k2, x AS v FROM range(1000000) t(x);",
+         "SELECT count(*) FROM p AS x JOIN s AS y USING (k1, k2)"),
+        ("probe 1k x 1M 3D",
+         "DROP TABLE IF EXISTS s; DROP TABLE IF EXISTS p; "
+         "CREATE TABLE s AS SELECT (x // 100)::INTEGER AS k1, (x // 10 % 10)::INTEGER AS k2, (x % 10)::INTEGER AS k3, x AS v FROM range(1000) t(x); "
+         "CREATE TABLE p AS SELECT (x // 100 % 10)::INTEGER AS k1, (x // 10 % 10)::INTEGER AS k2, (x % 10)::INTEGER AS k3, x AS v FROM range(1000000) t(x);",
+         "SELECT count(*) FROM p AS x JOIN s AS y USING (k1, k2, k3)"),
     ]
 
     rows = []
-    for label, dims, e in workloads:
-        n = e ** dims
-        if dims == 2:
-            create = (f"DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // {e})::INTEGER AS k1, (x % {e})::INTEGER AS k2, x AS v "
-                      f"FROM range({n}) t(x);")
-            join = f"SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2)"
-        else:
-            create = (f"DROP TABLE IF EXISTS a; CREATE TABLE a AS SELECT (x // {e * e})::INTEGER AS k1, (x // {e} % {e})::INTEGER AS k2, "
-                      f"(x % {e})::INTEGER AS k3, x AS v FROM range({n}) t(x);")
-            join = f"SELECT count(*) FROM a AS x JOIN a AS y USING (k1, k2, k3)"
+    for label, create, join in workloads:
         run(create, timer=False)
         ms = median_ms(join)
-        rows.append((label, n, ms))
-        print(f"  {label}: {n} rows, {ms:.3f} ms per join")
+        rows.append((label, ms))
+        print(f"  {label}: {ms:.3f} ms per join")
 
     print()
-    print(f"{'workload':<12}{'rows':>9}{'median ms':>10}")
-    for label, n, ms in rows:
-        print(f"{label:<12}{n:>9}{ms:>10.3f}")
+    print(f"{'workload':<20}{'median ms':>10}")
+    for label, ms in rows:
+        print(f"{label:<20}{ms:>10.3f}")
 
 
 if __name__ == "__main__":
