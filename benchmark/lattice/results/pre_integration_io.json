@@ -1,0 +1,21 @@
+{
+  "phase": "profile_gate_io",
+  "version": "v1.5.5",
+  "dims": 215,
+  "rows": 9938375,
+  "volume": 100000,
+  "volume_raw_s": 136.52390250004828,
+  "volume_raw_ms_per_query": 1.3652390250004829,
+  "volume_prepared_s": 156.7792388747912,
+  "volume_prepared_ms_per_query": 1.567792388747912,
+  "file_bytes": 96481280,
+  "file_warm": {
+    "P2/count_ms": 1.9471249543130398,
+    "P2/payload_ms": 2.2212080657482147,
+    "P3/count_ms": 1.7673748079687357,
+    "P3/payload_ms": 1.785916043445468
+  },
+  "purge_ok": false,
+  "purge_err": "Unable to purge disk buffers: Operation not permitted",
+  "file_cold": null
+}

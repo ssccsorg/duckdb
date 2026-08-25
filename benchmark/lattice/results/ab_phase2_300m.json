@@ -1,0 +1,37 @@
+{
+  "phase": "ab_phase2_300m",
+  "build": "release",
+  "rows": 300763000,
+  "dims": 670,
+  "extents": "670 cubed",
+  "repeats": 7,
+  "matrix_median_ms": {
+    "P3_point/B0_scan": 9.0,
+    "P3_point/B2_lattice": 1.0,
+    "R3_range/B0_scan": 8.0,
+    "R3_range/B2_lattice": 2.0,
+    "S1_point/B0_scan": 8.0,
+    "S1_point/B2_lattice": 330.0,
+    "S1_point/B1_art_forced": 0.0
+  },
+  "volume_3000": {
+    "B0_scan_total_s": 6.61,
+    "B0_scan_ms_per_query": 2.203,
+    "B2_lattice_total_s": 0.97,
+    "B2_lattice_ms_per_query": 0.325,
+    "ratio": 6.8
+  },
+  "scaling": {
+    "points": [
+      {"rows": 9938375, "B0_ms": 0.479, "B2_ms": 0.311, "ratio": 1.54},
+      {"rows": 99897344, "B0_ms": 1.091, "B2_ms": 0.312, "ratio": 3.5},
+      {"rows": 300763000, "B0_ms": 2.203, "B2_ms": 0.325, "ratio": 6.8}
+    ],
+    "note": "the lattice per-query cost is flat in the table size; the scan grows linearly, so the ratio grows with N"
+  },
+  "notes": [
+    "The 1B-row run is infeasible on this machine: 26 GB free disk against an estimated 40 GB peak for the 1B build.",
+    "The matrix P3 point is capped at 1 ms by the CLI timer resolution; the volume measurement is the reliable comparison.",
+    "Wide queries lose through the table function vehicle (S1 448,900 rows at 330 ms against 8 ms for the scan)."
+  ]
+}

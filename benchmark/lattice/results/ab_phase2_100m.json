@@ -1,0 +1,38 @@
+{
+  "phase": "ab_phase2_100m",
+  "build": "release",
+  "rows": 99897344,
+  "dims": 464,
+  "extents": "464 cubed",
+  "repeats": 7,
+  "matrix_median_ms": {
+    "P3_point/B0_scan": 4.0,
+    "P3_point/B2_lattice": 1.0,
+    "R3_range/B0_scan": 4.0,
+    "R3_range/B2_lattice": 3.0,
+    "S1_point/B0_scan": 3.0,
+    "S1_point/B2_lattice": 155.0,
+    "S1_point/B1_art_forced": 0.0
+  },
+  "volume_5000": {
+    "B0_scan_total_s": 5.46,
+    "B0_scan_ms_per_query": 1.091,
+    "B2_lattice_total_s": 1.56,
+    "B2_lattice_ms_per_query": 0.312,
+    "ratio": 3.5
+  },
+  "scaling": {
+    "B2_lattice_ms_per_query_10m": 0.311,
+    "B2_lattice_ms_per_query_100m": 0.312,
+    "B0_scan_ms_per_query_10m": 0.479,
+    "B0_scan_ms_per_query_100m": 1.091,
+    "note": "the lattice per-query cost is flat in the table size; the scan grows with N, so the ratio grows with N"
+  },
+  "notes": [
+    "At point-query volume the lattice wins 3.5x at 100M rows, up from 1.54x at 9.9M rows.",
+    "The lattice per-query cost is independent of the table size (0.311 ms at 9.9M, 0.312 ms at 100M), the ExaVerif pattern: the subspace, not the space.",
+    "The matrix P3 point is capped at 1 ms by the CLI timer resolution; the volume measurement is the reliable comparison.",
+    "Wide queries still lose through the table function vehicle (S1 46,225 rows at 155 ms against 3 ms for the scan); the lattice is a point-lookup access path.",
+    "The gain scales with N; a 1B-row table would raise the ratio further."
+  ]
+}
