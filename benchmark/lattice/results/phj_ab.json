@@ -1,0 +1,21 @@
+{
+  "phase": "phj_ab",
+  "build_phj": "release with the multi-dimension PHJ (branch 55-join-probe)",
+  "build_ht": "release original (main): multi-condition joins use the regular HT",
+  "repeats": 7,
+  "results": [
+    {"workload": "2D 100^2", "rows": 10000, "phj_ms": 1.0, "ht_ms": 2.0, "ratio_phj_over_ht": 2.0},
+    {"workload": "2D 300^2", "rows": 90000, "phj_ms": 4.0, "ht_ms": 4.0, "ratio_phj_over_ht": 1.0},
+    {"workload": "2D 700^2", "rows": 490000, "phj_ms": 11.0, "ht_ms": 11.0, "ratio_phj_over_ht": 1.0},
+    {"workload": "3D 21^3", "rows": 9261, "phj_ms": 1.0, "ht_ms": 2.0, "ratio_phj_over_ht": 2.0},
+    {"workload": "3D 40^3", "rows": 64000, "phj_ms": 3.0, "ht_ms": 4.0, "ratio_phj_over_ht": 1.33},
+    {"workload": "3D 90^3", "rows": 729000, "phj_ms": 21.0, "ht_ms": 14.0, "ratio_phj_over_ht": 0.67}
+  ],
+  "notes": [
+    "The small workloads show a 2x PHJ gain, but the CLI timer resolution is 1 ms, so the small numbers are coarse.",
+    "At 3D 90^3 (729k rows) the PHJ is slower (21 ms against 14 ms): the build overhead dominates.",
+    "The PHJ build is a per-row scalar mixed-radix fold over D key columns plus a Gather into the position table; the regular HT build is vectorized hashing.",
+    "The workload is a dense self join with count(*); the probe does not dominate, so the PHJ probe advantage does not offset the build cost at scale.",
+    "Follow-up: vectorize the mixed-radix fold (per-dimension offset computation is already vectorizable per column) and compare on probe-dominated workloads."
+  ]
+}
