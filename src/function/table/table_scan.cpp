@@ -10,6 +10,9 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include <algorithm>
+#include <iterator>
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -753,8 +756,11 @@ bool TryScanIndex(ART &art, IndexEntry &entry, const ColumnList &column_list, Ta
 
 			auto &bound_column_ref_expr = expr.Cast<BoundColumnRefExpression>();
 
-			// If the bound column references the index column, use updated_index_column
-			if (bound_column_ref_expr.Binding().column_index == indexed_columns[0]) {
+			// The unbound index expression references the indexed columns positionally
+			// (0 .. column_ids.size() - 1), so a single-column index carries its one bound
+			// column ref at position 0. Rewrite it to the input projection position of the
+			// indexed table column, which the filter expression also binds to.
+			if (bound_column_ref_expr.Binding().column_index == 0) {
 				bound_column_ref_expr.BindingMutable().column_index = updated_index_column;
 			}
 		});
@@ -819,6 +825,57 @@ bool TryScanIndex(ART &art, IndexEntry &entry, const ColumnList &column_list, Ta
 	return true;
 }
 
+// Scan one single-column ART per filtered column and intersect the row-ID sets.
+// This is the FIXME option 1: find and scan one ART for each filter, then return
+// the intersecting row IDs. Returns true when every filtered column was covered
+// by a qualifying index scan; the row-ID set is the intersection and can be empty.
+static bool TryMultiFilterIndexScan(const TableIndexList &indexes, const ColumnList &column_list,
+                                    TableFunctionInitInput &input, TableFilterSet &filter_set, idx_t max_count,
+                                    set<row_t> &row_ids) {
+	// one row-ID set per scanned column
+	vector<set<row_t>> sets;
+	// the columns already covered by a qualifying scan, to skip duplicate ART indexes
+	unordered_set<column_t> covered_columns;
+
+	for (auto &entry : indexes.IndexEntries()) {
+		auto &index = *entry.index;
+		if (index.GetIndexType() != ART::TYPE_NAME) {
+			continue;
+		}
+		D_ASSERT(index.IsBound());
+		auto &art = index.Cast<ART>();
+		if (art.unbound_expressions.size() != 1 || art.GetColumnIds().size() != 1) {
+			continue; // single-column ARTs only
+		}
+		const auto indexed_column = art.GetColumnIds()[0];
+		if (covered_columns.count(indexed_column)) {
+			continue; // this column already scanned
+		}
+		set<row_t> partial;
+		if (TryScanIndex(art, entry, column_list, input, filter_set, max_count, partial)) {
+			covered_columns.insert(indexed_column);
+			sets.push_back(std::move(partial));
+		}
+	}
+
+	// every filtered column must have a qualifying single-column ART
+	if (covered_columns.size() != filter_set.FilterCount()) {
+		return false;
+	}
+
+	// intersect, starting from the smallest set
+	std::sort(sets.begin(), sets.end(),
+	          [](const set<row_t> &a, const set<row_t> &b) { return a.size() < b.size(); });
+	row_ids = std::move(sets[0]);
+	for (idx_t i = 1; i < sets.size(); i++) {
+		set<row_t> intersected;
+		std::set_intersection(row_ids.begin(), row_ids.end(), sets[i].begin(), sets[i].end(),
+		                      std::inserter(intersected, intersected.end()));
+		row_ids = std::move(intersected);
+	}
+	return true;
+}
+
 unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	D_ASSERT(input.bind_data);
 
@@ -836,17 +893,12 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 		return DuckTableScanInitGlobal(context, input, storage, bind_data);
 	}
 
+	// Multi-filter index scans use the FIXME option 1: scan one single-column ART
+	// per filtered column and intersect the row-ID sets. Each individual filter
+	// must stay below the index-scan threshold, so the path activates where every
+	// filtered dimension is individually selective. The compound-ART variant
+	// (option 2) stays out of scope.
 	auto &filter_set = *input.filters;
-
-	// FIXME: We currently only support scanning one ART with one filter.
-	// If multiple filters exist, i.e., a = 11 AND b = 24, we need to
-	// 1.	1.1. Find + scan one ART for a = 11.
-	//		1.2. Find + scan one ART for b = 24.
-	//		1.3. Return the intersecting row IDs.
-	// 2. (Reorder and) scan a single ART with a compound key of (a, b).
-	if (filter_set.FilterCount() != 1) {
-		return DuckTableScanInitGlobal(context, input, storage, bind_data);
-	}
 
 	auto &info = storage.GetDataTableInfo();
 	auto &indexes = info->GetIndexes();
@@ -877,18 +929,22 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 		vacuum_lock = DuckTransactionManager::Get(attached).SharedVacuumLock();
 	}
 
-	for (auto &entry : indexes.IndexEntries()) {
-		auto &index = *entry.index;
-		if (index.GetIndexType() != ART::TYPE_NAME) {
-			continue;
+	if (filter_set.FilterCount() == 1) {
+		for (auto &entry : indexes.IndexEntries()) {
+			auto &index = *entry.index;
+			if (index.GetIndexType() != ART::TYPE_NAME) {
+				continue;
+			}
+			D_ASSERT(index.IsBound());
+			auto &art = index.Cast<ART>();
+			index_scan = TryScanIndex(art, entry, column_list, input, filter_set, max_count, row_ids);
+			if (index_scan) {
+				// found an index - break
+				break;
+			}
 		}
-		D_ASSERT(index.IsBound());
-		auto &art = index.Cast<ART>();
-		index_scan = TryScanIndex(art, entry, column_list, input, filter_set, max_count, row_ids);
-		if (index_scan) {
-			// found an index - break
-			break;
-		}
+	} else {
+		index_scan = TryMultiFilterIndexScan(indexes, column_list, input, filter_set, max_count, row_ids);
 	}
 
 	if (!index_scan) {
