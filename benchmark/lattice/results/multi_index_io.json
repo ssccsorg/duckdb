@@ -1,0 +1,36 @@
+{
+  "phase": "multi_index_io",
+  "method": "warm = median of 7 CLI runs; cold = purge plus 24 GB memory pressure before every query, 3 samples, run as root through osascript",
+  "build": "release",
+  "table": {
+    "rows": 100000000,
+    "extent": 10000,
+    "layout": "random order, unprunable by zonemaps",
+    "file_bytes": 5029507072,
+    "note": "the file is dominated by the two single-column ART indexes (about 2.5 GB each); the compressed data is about 0.7 GB"
+  },
+  "warm_median_ms": {
+    "count_scan": 37.0,
+    "count_multi_index": 10.0,
+    "count_ratio_scan_over_index": 3.7,
+    "payload_scan": 34.0,
+    "payload_multi_index": 7.0,
+    "payload_ratio_scan_over_index": 4.9
+  },
+  "cold_median_ms": {
+    "count_scan": 102.0,
+    "count_multi_index": 26.0,
+    "count_ratio_scan_over_index": 3.9,
+    "payload_scan": 98.0,
+    "payload_multi_index": 22.0,
+    "payload_ratio_scan_over_index": 4.5
+  },
+  "notes": [
+    "The multi-filter index scan (the TableScanInitGlobal FIXME option 1: scan one single-column ART per filtered column and intersect the row-ID sets) activates at the default settings on this table, because the per-dimension selectivity (0.01 percent) is below the 0.1 percent threshold. It wins 3.7 to 4.9x warm and about 4.5x cold against the scan on the random-order layout, where the scan reads all compressed data and cannot prune.",
+    "The scan side is measured on the same table with index_scan_percentage = 0; both sides run the identical query.",
+    "The cold ratio is bounded by the compressed data volume (about 0.7 GB, which fits in RAM): the first cold sample measures 224 ms against 26 ms (8.6x), and the median after the first touch is 102 ms against 26 ms (3.9x).",
+    "The implementation fixes a latent binding bug in TryScanIndex: the unbound index expression references the indexed columns positionally, and the update condition compared that positional index against the table column id, so index scans on non-first columns never activated. The fix rewrites the positional ref to the input projection position; the single-filter non-first-column check in verify_multi_index.sh covers it.",
+    "Correctness is verified by benchmark/lattice/verify_multi_index.sh: 2-filter and 3-filter intersections match the analytic expectations, filter order is irrelevant, empty results are correct, a missing index on a filtered column falls back to the scan, and the default threshold falls back on the E=215 table (per-dimension selectivity 0.465 percent above the 0.1 percent threshold).",
+    "Range filters still fall back to the scan, matching the pre-existing single-filter behavior (range filters are conjunctions that the index scan matcher does not handle); the FIXME scope is point equality filters."
+  ]
+}
