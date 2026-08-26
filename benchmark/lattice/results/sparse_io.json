@@ -1,0 +1,41 @@
+{
+  "phase": "sparse_io",
+  "method": "warm median of 7 CLI runs; the sparse table stores cell and payload packed in cell order; the cell index is a stock single-column ART",
+  "build": "release",
+  "density": "10 percent of cells populated (cell modulo 10 equals 0)",
+  "tables": {
+    "215": {
+      "cells": 9938375,
+      "dense_bytes": 31993856,
+      "sparse_rows": 993838,
+      "sparse_plus_dense_map_bytes_no_index": 25964544,
+      "sparse_plus_dense_map_with_art_index_bytes": 104869888,
+      "scan_ms": 1.0,
+      "dense_map_path_ms": 2.0
+    },
+    "600m": {
+      "cells": 599077107,
+      "dense_bytes": 2558537728,
+      "sparse_rows": 59907711,
+      "sparse_data_bytes": 127926272,
+      "sparse_with_cell_art_index_bytes": 1771581440,
+      "cell_art_index_bytes": 1538785280,
+      "scan_ms": 2.0,
+      "index_ms": 2.0
+    }
+  },
+  "reference_dense_600m": {
+    "note": "from results/cold_io.json warm medians on the same build",
+    "scan_ms": 16.0,
+    "lattice_ms": 1.0,
+    "ratio": 16.0,
+    "ratio_in_process": 11.3
+  },
+  "notes": [
+    "EXPLAIN ANALYZE: the sparse point scan prunes to 1 of 9 row groups at the 215 space, and the indexed query at the 600M space is an index scan (0 of 488 row groups).",
+    "The lattice closed form maps a cell to a row offset only when the table is dense. A sparse table needs a cell-to-row map, and the query through the map is a stock single-column index lookup, which DuckDB already provides; the lattice adds no access-path advantage at sparse density.",
+    "Sparsity weakens the incumbent: at 10 percent density the sparse scan is 8x cheaper than the dense scan (2.0 ms against 16.0 ms at 600M, fewer row groups and less metadata), and the index path is at parity with the sparse scan (2.0 ms against 2.0 ms), against the dense lattice win of 16x (CLI) and 11.3x (in-process).",
+    "Storage: the dense cell map compresses well in DuckDB's columnar format (sparse data plus map at 26 MB against the dense 32 MB at the 215 space), smaller than the raw 80 MB estimate in the plan; but the ART index over the map costs 79 MB at 215 and 1.54 GB at 600M, nearly doubling the total file against the dense table.",
+    "The boundary is the density assumption: the flat closed-form advantage exists only for the dense table; sparse tables fall back to the stock index path, whose measured advantage over the scan is parity at this scale."
+  ]
+}

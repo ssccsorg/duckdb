@@ -272,15 +272,25 @@ JoinFilterLocalState::~JoinFilterLocalState() {
 }
 
 static bool CanUsePerfectHashJoin(const PhysicalHashJoin &op, PerfectHashJoinExecutor &perfect_join_executor) {
-	if (op.conditions.size() != 1 || !op.conditions[0].GetRightStats()) {
+	if (op.conditions.empty()) {
 		return false;
 	}
-	const auto &right_stats = *op.conditions[0].GetRightStats();
-	if (!TypeIsIntegral(right_stats.GetType().InternalType()) || !NumericStats::HasMinMax(right_stats)) {
-		return false;
+	vector<Value> mins;
+	vector<Value> maxs;
+	mins.reserve(op.conditions.size());
+	maxs.reserve(op.conditions.size());
+	for (const auto &cond : op.conditions) {
+		if (cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL || !cond.GetRightStats()) {
+			return false;
+		}
+		const auto &right_stats = *cond.GetRightStats();
+		if (!TypeIsIntegral(right_stats.GetType().InternalType()) || !NumericStats::HasMinMax(right_stats)) {
+			return false;
+		}
+		mins.push_back(NumericStats::Min(right_stats));
+		maxs.push_back(NumericStats::Max(right_stats));
 	}
-	return perfect_join_executor.CanDoPerfectHashJoin(op, NumericStats::Min(right_stats),
-	                                                  NumericStats::Max(right_stats));
+	return perfect_join_executor.CanDoPerfectHashJoin(op, mins, maxs);
 }
 
 unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientContext &context,
@@ -1986,7 +1996,26 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	}
 
 	// check for possible perfect hash table
-	auto use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
+	vector<Value> mins;
+	vector<Value> maxs;
+	if (conditions.size() == 1) {
+		// the runtime min/max (filter pushdown or the full type range) applies to the single key
+		mins.push_back(min);
+		maxs.push_back(max);
+	} else {
+		// multi-dimension: the runtime filter-pushdown narrowing is single-key only, so the static
+		// per-condition statistics decide
+		for (const auto &cond : conditions) {
+			if (!cond.GetRightStats() || !NumericStats::HasMinMax(*cond.GetRightStats())) {
+				mins.clear();
+				maxs.clear();
+				break;
+			}
+			mins.push_back(NumericStats::Min(*cond.GetRightStats()));
+			maxs.push_back(NumericStats::Max(*cond.GetRightStats()));
+		}
+	}
+	auto use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, mins, maxs);
 	// PHJ's FullScanHashTable reads payload at native width; if any slot was narrowed it would crash. Runtime
 	// min/max from filter pushdown can re-enable PHJ here, so re-check after dict-surviving may have narrowed.
 	if (use_perfect_hash && sink.DictSurvivingActive()) {
