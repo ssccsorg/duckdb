@@ -1,0 +1,75 @@
+{
+  "phase": "cold_io",
+  "method": "warm = median of 7 CLI runs; cold = purge plus 24 GB memory pressure before every query, 3 samples, run as root through osascript",
+  "build": "release",
+  "pruning": {
+    "note": "EXPLAIN ANALYZE on the 600M lattice-sorted table: the B0 scan is zonemap-pruned and does not read the whole table",
+    "row_group_size": 122880,
+    "P3_point_row_groups_scanned": "2/4876",
+    "R3_range_row_groups_scanned": "14/4876",
+    "S1_point_row_groups_scanned": "7/4876"
+  },
+  "tables": {
+    "215": {
+      "rows": 9938375,
+      "dims": 215,
+      "file_bytes": 31993856,
+      "warm_median_ms": {
+        "P3_point/B0_scan": 2.0,
+        "P3_point/B2_lattice": 1.0,
+        "R3_range/B0_scan": 3.0,
+        "R3_range/B2_lattice": 2.0,
+        "S1_point/B0_scan": 1.0,
+        "S1_point/B2_lattice": 33.0
+      },
+      "cold_median_ms": {
+        "P3_point/B0_scan": 12.0,
+        "P3_point/B2_lattice": 9.0,
+        "R3_range/B0_scan": 13.0,
+        "R3_range/B2_lattice": 13.0,
+        "S1_point/B0_scan": 10.0,
+        "S1_point/B2_lattice": 52.0
+      },
+      "cold_ratio_scan_over_lattice": {
+        "P3_point": 1.33,
+        "R3_range": 1.0,
+        "S1_point": 0.19
+      }
+    },
+    "600m": {
+      "rows": 599077107,
+      "dims": 843,
+      "file_bytes": 2558537728,
+      "warm_median_ms": {
+        "P3_point/B0_scan": 16.0,
+        "P3_point/B2_lattice": 1.0,
+        "R3_range/B0_scan": 13.0,
+        "R3_range/B2_lattice": 2.0,
+        "S1_point/B0_scan": 16.0,
+        "S1_point/B2_lattice": 528.0
+      },
+      "cold_median_ms": {
+        "P3_point/B0_scan": 27.0,
+        "P3_point/B2_lattice": 10.0,
+        "R3_range/B0_scan": 27.0,
+        "R3_range/B2_lattice": 15.0,
+        "S1_point/B0_scan": 26.0,
+        "S1_point/B2_lattice": 873.0
+      },
+      "cold_ratio_scan_over_lattice": {
+        "P3_point": 2.7,
+        "R3_range": 1.8,
+        "S1_point": 0.03
+      }
+    }
+  },
+  "notes": [
+    "The cold-cache experiment refutes the I/O-dominance hypothesis for the point query on the lattice-sorted table: the B0 scan is zonemap-pruned to 2 of 4,876 row groups, so its cold read is about 19 MB of row-group metadata plus 1 MB of data, not the whole 2.56 GB file. The cold P3 ratio at 600M is 2.7x against 16x warm on the same CLI timer.",
+    "The lattice pays a fixed cold-start I/O latency of about 9 to 10 ms (catalog, table metadata, addressed pages), independent of the table size: the 9.9M and the 600M tables both measure 9 to 10 ms cold for the lattice point query.",
+    "The scan cold cost grows with N through the row-group metadata traversal (about 0.76 us per row group): 12 ms at 9.9M (81 row groups) against 27 ms at 600M (4,876 row groups).",
+    "The B0 scan in the A/B scaling law is therefore a pruned scan, not a full table scan. The full scan (9,938,375 rows, 1 matched) was measured on the random-order gate table. The lattice win is skipping the O(N/122,880) row-group zonemap traversal plus the residual row-group reads; the scaling law holds, but the mechanism differs from the full-row reading.",
+    "Wide queries lose in cold as in warm: the S1 lattice at 600M measures 873 ms against 26 ms for the scan.",
+    "The I/O-dominance claim would need a workload where the scan reads the whole file: an unprunable layout (random order, incompatible with the lattice closed form) or a query covering nearly all row groups.",
+    "A purge-only run without the memory pressure gave similar numbers (partial eviction: 24 ms against 9 ms for the 600M P3), and the pressure protocol is the definitive one."
+  ]
+}

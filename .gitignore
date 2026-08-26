@@ -365,3 +365,7 @@ generated_extension_loader_package_build.cpp
 
 # clangd tidy/format cache
 .cache
+
+# Lattice bench databases (reproducible via bench_cold_io.py --build)
+benchmark/lattice/results/*.duckdb
+benchmark/lattice/results/*.duckdb.wal
